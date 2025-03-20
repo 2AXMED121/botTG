@@ -1,0 +1,174 @@
+from config import BOT_TOKEN
+import asyncio
+import aiohttp
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+
+class CurrencyConverter:
+
+    def __init__(self, api_url):
+
+        self.api_url = api_url
+        self.rates = {}
+
+    async def update_rates(self):
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(self.api_url) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    self.rates = data["rates"]
+            except (aiohttp.ClientError, ValueError) as e:
+                print(f"Ошибка при получении курсов валют: {e}")
+                self.rates = {}
+
+    def convert(self, from_currency, to_currency, amount):
+        if not self.rates:
+            return None
+
+        if from_currency not in self.rates or to_currency not in self.rates:
+            return None
+        try:
+            rate_from = float(self.rates[from_currency])
+            rate_to = float(self.rates[to_currency])
+            return amount * (rate_to / rate_from)
+        except (ValueError, TypeError):
+            return None
+
+
+class ConversionStates(StatesGroup):
+    waiting_for_from_currency = State()
+    waiting_for_to_currency = State()
+    waiting_for_amount = State()
+
+
+API_URL = "https://open.er-api.com/v6/latest/USD"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+converter = CurrencyConverter(API_URL)
+
+
+@dp.message(CommandStart())
+async def start_command(message: types.Message):
+    await message.answer("Привет! Я конвертер валют. Чтобы начать, введите /convert.")
+
+
+@dp.message(lambda message: message.text == "/convert")
+async def convert_command(message: types.Message, state: FSMContext):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="EUR", callback_data="from_EUR"),
+            InlineKeyboardButton(text="RUB", callback_data="from_RUB"),
+            InlineKeyboardButton(text="USD", callback_data="from_USD"),
+        ],
+        [
+            InlineKeyboardButton(text="Выбрать другую валюту", callback_data="from_other")
+        ]
+    ])
+    await message.answer("Выберите исходную валюту:", reply_markup=keyboard)
+    await state.set_state(ConversionStates.waiting_for_from_currency)
+
+
+@dp.callback_query(ConversionStates.waiting_for_from_currency)
+async def from_currency_callback(query: types.CallbackQuery, state: FSMContext):
+    if query.data.startswith("from_"):
+        if query.data == "from_other":
+            await query.message.answer("Пожалуйста, введите исходную валюту (например, GBP):")
+        else:
+            from_currency = query.data[5:] 
+            await state.update_data(from_currency=from_currency)
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="EUR", callback_data="to_EUR"),
+                    InlineKeyboardButton(text="RUB", callback_data="to_RUB"),
+                    InlineKeyboardButton(text="USD", callback_data="to_USD"),
+                ],
+                [
+                    InlineKeyboardButton(text="Выбрать другую валюту", callback_data="to_other")
+                ]
+            ])
+            await query.message.answer("Теперь выберите валюту, в которую нужно перевести:", reply_markup=keyboard)
+            await state.set_state(ConversionStates.waiting_for_to_currency)
+        await query.answer() 
+
+
+@dp.message(ConversionStates.waiting_for_from_currency)
+async def from_currency_state(message: types.Message, state: FSMContext):
+
+    from_currency = message.text.upper()
+    await state.update_data(from_currency=from_currency)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="EUR", callback_data="to_EUR"),
+            InlineKeyboardButton(text="RUB", callback_data="to_RUB"),
+            InlineKeyboardButton(text="USD", callback_data="to_USD"),
+        ],
+        [
+            InlineKeyboardButton(text="Выбрать другую валюту", callback_data="to_other")
+        ]
+    ])
+    await message.answer(
+        "Теперь выберите валюту, в которую нужно перевести:", reply_markup=keyboard
+    )
+    await state.set_state(ConversionStates.waiting_for_to_currency)
+
+
+@dp.callback_query(ConversionStates.waiting_for_to_currency)
+async def to_currency_callback(query: types.CallbackQuery, state: FSMContext):
+    if query.data.startswith("to_"):
+        if query.data == "to_other":
+            await query.message.answer("Теперь введите валюту, в которую нужно перевести (например, GBP):")
+        else:
+            to_currency = query.data[3:]
+            await state.update_data(to_currency=to_currency)
+            await query.message.answer("Теперь введите сумму для конвертации:")
+            await state.set_state(ConversionStates.waiting_for_amount)
+        await query.answer()  
+
+
+@dp.message(ConversionStates.waiting_for_to_currency)
+async def to_currency_state(message: types.Message, state: FSMContext):
+    to_currency = message.text.upper()
+    await state.update_data(to_currency=to_currency)
+    await message.answer("Теперь введите сумму для конвертации:")
+    await state.set_state(ConversionStates.waiting_for_amount)
+
+
+@dp.message(ConversionStates.waiting_for_amount)
+async def amount_state(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        data = await state.get_data()
+        from_currency = data["from_currency"]
+        to_currency = data["to_currency"]
+
+        await converter.update_rates()
+        result = converter.convert(from_currency, to_currency, amount)
+
+        if result is not None:
+            await message.answer(
+                f"{amount} {from_currency} = {result:.2f} {to_currency}"
+            )
+        else:
+            await message.answer(
+                "Не удалось выполнить конвертацию.  Убедитесь, что введены корректные коды валют и попробуйте еще раз."
+            )
+
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректную сумму (число).")
+    finally:
+        await state.clear()
+
+
+async def main():
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
