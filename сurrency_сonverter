@@ -13,11 +13,11 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.bot import DefaultBotProperties
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
 
-BOT_TOKEN = "7565225297:AAFdV546yY3gAKftdblGows8Ys80Fh4sf2s"
+BOT_TOKEN = "7550305230:AAEY4WlFF87qV39Z6rQvd9dj0QUqoXsygKs"
 API_URL = "https://open.er-api.com/v6/latest/USD"
 LIMITED_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "RUB", "CAD"}
 EXCHANGE_RATES = {}
-DEFAULT_CURRENCY = "USD"
+DEFAULT_CURRENCY = None  # Default to None, indicating no currency is initially selected
 
 class CurrencySettings(StatesGroup):
     waiting_for_currency = State()
@@ -26,7 +26,7 @@ currency_preferences = {}
 
 class NumberInputFilter(Filter):
     async def __call__(self, message: types.Message) -> bool:
-        if message.text and re.match(r"^\d+(\.\d+)?$", message.text.strip()):
+        if message.text and re.match(r"^\d+([.,]\d+)?$", message.text.strip()):  # Allow . or ,
             return True
         return False
 
@@ -68,19 +68,79 @@ async def fetch_exchange_rates():
     except aiohttp.ClientError as e:
         print(f"Ошибка подключения к API: {e}")
 
-async def start_command(message: types.Message):
+async def start_command(message: types.Message, bot: Bot):
     user_id = message.from_user.id
     preferred_currency = await get_preferred_currency(user_id)
-    await message.answer(f"Привет! Ваша текущая валюта - {preferred_currency}. Используйте /setcurrency, чтобы изменить ее.")
+
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username
+    query_text = f"@{bot_username} setcurrency"  # Start inline query with "setcurrency"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Выбрать/Изменить валюту", switch_inline_query_current_chat=query_text)]
+    ])
+
+    if preferred_currency is None:
+        # No currency selected yet
+        await message.answer("Пожалуйста, выберите основную валюту:", reply_markup=keyboard)
+    else:
+        await message.answer(f"Текущая валюта: {preferred_currency}. Чтобы конвертировать, пришлите в чат сумму.\nДля изменения основной валюты нажмите кнопку ниже:", reply_markup=keyboard)
+
+async def currency_callback_handler(query: types.CallbackQuery, bot: Bot):
+    currency_code = query.data.split(":")[1]
+    user_id = query.from_user.id
+
+    if currency_code in EXCHANGE_RATES:
+        await set_preferred_currency(user_id, currency_code)
+
+        # Check if query.message is not None before passing it to start_command
+        if query.message:
+            await start_command(query.message, bot)
+        else:
+            # If query.message is None, send a new message instead
+            bot_info = await bot.get_me()
+            bot_username = bot_info.username
+            preferred_currency = await get_preferred_currency(user_id)
+            query_text = f"@{bot_username} setcurrency"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Выбрать/Изменить валюту", switch_inline_query_current_chat=query_text)]
+            ])
+            await bot.send_message(user_id, f"Текущая валюта: {preferred_currency}. Чтобы конвертировать, пришлите в чат сумму.\nДля изменения основной валюты нажмите кнопку ниже:", reply_markup=keyboard)
 
 
-async def set_currency_command(message: types.Message, state: FSMContext):
+        await query.answer(f"Валюта установлена на {currency_code}") # optional confirmation toast
+    else:
+        await query.answer("Произошла ошибка. Пожалуйста, попробуйте еще раз.")
+
+
+
+async def change_currency_command(message: types.Message, bot: Bot):
+    user_id = message.from_user.id
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username
+    query_text = f"@{bot_username} setcurrency"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Изменить валюту", switch_inline_query_current_chat=query_text)]
+    ])
+    await message.answer("Для изменения основной валюты нажмите кнопку ниже:", reply_markup=keyboard)
+
+
+async def set_currency_command(message: types.Message, state: FSMContext, bot:Bot):  # bot argument added
+    
+    user_id = message.from_user.id
+    preferred_currency = await get_preferred_currency(user_id)
+
+    button_text = "Выберите основную валюту"
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=currency, callback_data=f"set_currency:{currency}") for currency in EXCHANGE_RATES]
     ])
 
     await message.answer("Пожалуйста, выберите код желаемой валюты:", reply_markup=keyboard)
     await state.set_state(CurrencySettings.waiting_for_currency)
+
 
 
 async def process_currency_input(message: types.Message, state: FSMContext):
@@ -92,22 +152,17 @@ async def process_currency_input(message: types.Message, state: FSMContext):
     else:
         await message.answer("Неверный код валюты. Пожалуйста, попробуйте еще раз.")
 
-async def currency_callback_handler(query: types.CallbackQuery, state: FSMContext):
-    currency_code = query.data.split(":")[1]
-
-    if currency_code in EXCHANGE_RATES:
-        await set_preferred_currency(query.from_user.id, currency_code)
-        await query.message.edit_text(f"Валюта установлена на {currency_code}.")
-        await state.clear()
-        await query.answer()
-    else:
-        await query.answer("Произошла ошибка. Пожалуйста, попробуйте еще раз.")
 
 
 async def handle_number_input(message: types.Message, bot: Bot):
-    amount = float(message.text)
+    amount_str = message.text.replace(",", ".") # Replace comma with dot
+    amount = float(amount_str)
     user_id = message.from_user.id
     preferred_currency = await get_preferred_currency(user_id)
+
+    if not preferred_currency:  # Handle case where no currency is set
+        await message.answer("Сначала выберите валюту с помощью /start или /setcurrency.")
+        return
 
     button_text = "Конвертировать валюту"
     bot_info = await bot.get_me()
@@ -120,13 +175,31 @@ async def handle_number_input(message: types.Message, bot: Bot):
     await message.answer("Конвертировать это значение:", reply_markup=keyboard)
 
 
-async def inline_query_handler(inline_query: types.InlineQuery):
+async def inline_query_handler(inline_query: types.InlineQuery, bot: Bot):
     user_id = inline_query.from_user.id
     preferred_currency = await get_preferred_currency(user_id)
     query = inline_query.query
 
+    if "setcurrency" in query:  # Handle "setcurrency" inline query
+        results = []
+        for currency_code in EXCHANGE_RATES:
+            # Instead of sending a command, use callback data to set the currency
+            results.append(
+                InlineQueryResultArticle(
+                    id=currency_code,
+                    title=currency_code,
+                    description=f"Установить {currency_code} в качестве основной валюты.",
+                    input_message_content=InputTextMessageContent(message_text=f"Выбрана валюта {currency_code}"), # Replace the content of the message
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Подтвердить", callback_data=f"set_currency:{currency_code}")]]),
+                )
+            )
+        await inline_query.answer(results, cache_time=1)
+        return
+
+
     try:
         _, amount_str, base_currency = query.split()
+        amount_str = amount_str.replace(",", ".") #  handle comma
         amount = float(amount_str)
         base_currency = base_currency.upper()
     except ValueError:
@@ -173,8 +246,9 @@ async def main():
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
-    dp.message.register(start_command, Command("start"))
-    dp.message.register(set_currency_command, Command("setcurrency"),)
+    dp.message.register(start_command, Command("start", ignore_case=True)) #Pass bot to start command
+    dp.message.register(change_currency_command, Command("changecurrency", ignore_case=True))
+    dp.message.register(set_currency_command, Command("setcurrency", ignore_case=True))
     dp.message.register(process_currency_input, CurrencySettings.waiting_for_currency)
     dp.callback_query.register(currency_callback_handler, lambda query: query.data.startswith("set_currency:"))
 
